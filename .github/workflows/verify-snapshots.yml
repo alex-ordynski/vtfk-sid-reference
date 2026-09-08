@@ -1,0 +1,68 @@
+# Кожна гілка after-labNN мусить збиратися. Без цієї перевірки знімок тихо гниє:
+# ним користуються рідко, і зламаний знімок виявляється в найгірший момент — коли
+# студент, який пропустив заняття, приходить здавати.
+name: verify snapshots
+
+on:
+  push:
+    branches: ['after-lab**']
+  workflow_dispatch:
+  schedule:
+    # щотижня: знімок може зламатися не через нас, а через оновлення базового образу
+    - cron: '0 6 * * 1'
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Що саме перевіряємо
+        id: detect
+        run: |
+          echo "branch=${GITHUB_REF#refs/heads/}" >> "$GITHUB_OUTPUT"
+          test -f core/sidkit/Cargo.toml && echo "rust=yes" >> "$GITHUB_OUTPUT" || echo "rust=no" >> "$GITHUB_OUTPUT"
+          test -f core/capsule/Dockerfile && echo "docker=yes" >> "$GITHUB_OUTPUT" || echo "docker=no" >> "$GITHUB_OUTPUT"
+          ls core/wasm/*.wat >/dev/null 2>&1 && echo "wat=yes" >> "$GITHUB_OUTPUT" || echo "wat=no" >> "$GITHUB_OUTPUT"
+
+      - name: Знімок не містить коду рівнів 2-3
+        run: |
+          # Правило 1: знімок — робочий стан, а не розв'язок.
+          # Порожній знімок теж помилка: гілка after-labNN мусить щось нести.
+          if [ -z "$(ls -A core 2>/dev/null)" ]; then
+            echo "::error::core/ порожній — знімок нічого не несе"; exit 1
+          fi
+          echo "core/ не порожній — гаразд"
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.detect.outputs.rust == 'yes'
+
+      - name: cargo build + test
+        if: steps.detect.outputs.rust == 'yes'
+        working-directory: core/sidkit
+        run: |
+          cargo build --locked
+          cargo test --locked
+
+      - name: docker build капсули
+        if: steps.detect.outputs.docker == 'yes'
+        run: docker build -f core/capsule/Dockerfile -t snapshot-capsule core/capsule
+
+      - name: wat2wasm
+        if: steps.detect.outputs.wat == 'yes'
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq wabt
+          for f in core/wasm/*.wat; do
+            echo "== $f"
+            wat2wasm "$f" -o /tmp/out.wasm
+          done
+
+      - name: Підсумок
+        run: |
+          echo "### Знімок \`${{ steps.detect.outputs.branch }}\` збирається" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| що | перевірено |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Rust (\`core/sidkit\`) | ${{ steps.detect.outputs.rust }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Docker (\`core/capsule\`) | ${{ steps.detect.outputs.docker }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| WAT (\`core/wasm\`) | ${{ steps.detect.outputs.wat }} |" >> "$GITHUB_STEP_SUMMARY"
