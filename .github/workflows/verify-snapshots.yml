@@ -7,7 +7,7 @@
 #   • щотижня (schedule)         — перевіряються ВСІ гілки after-lab* (schedule завжди
 #                                  стартує з main, а main — це правила, не знімок);
 #   • вручну (workflow_dispatch) — гілки за шаблоном `pattern` (за замовчуванням after-lab*);
-#                                  порожній pattern — лише та гілка, з якої запущено.
+#                                  pattern `-` — лише та гілка, з якої запущено (--ref).
 # main у список не потрапляє ніколи: знімків на ньому немає, і «core/ порожній» там — норма.
 name: verify snapshots
 
@@ -17,7 +17,7 @@ on:
   workflow_dispatch:
     inputs:
       pattern:
-        description: 'Які гілки перевірити (glob для git ls-remote). Порожньо — лише поточна.'
+        description: 'Які гілки перевірити (glob для git ls-remote). «-» — лише поточна (--ref).'
         required: false
         default: 'after-lab*'
   schedule:
@@ -38,11 +38,11 @@ jobs:
           REPO_URL: ${{ github.server_url }}/${{ github.repository }}
         run: |
           case "$EVENT" in
-            push) pattern="" ;;
+            push) pattern="-" ;;
             schedule) pattern="after-lab*" ;;
             *) pattern="$PATTERN" ;;
           esac
-          if [ -z "$pattern" ]; then
+          if [ "$pattern" = "-" ] || [ -z "$pattern" ]; then
             names="$GITHUB_REF_NAME"
           else
             names="$(git ls-remote --heads "$REPO_URL" "refs/heads/$pattern" | sed 's#.*refs/heads/##' | sort)"
