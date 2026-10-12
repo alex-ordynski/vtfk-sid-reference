@@ -1,38 +1,97 @@
 # Кожна гілка after-labNN мусить збиратися. Без цієї перевірки знімок тихо гниє:
 # ним користуються рідко, і зламаний знімок виявляється в найгірший момент — коли
 # студент, який пропустив заняття, приходить здавати.
+#
+# Червоний прогін означає одне: зламаний знімок. Тому:
+#   • push у after-labNN        — перевіряється ця гілка;
+#   • щотижня (schedule)         — перевіряються ВСІ гілки after-lab* (schedule завжди
+#                                  стартує з main, а main — це правила, не знімок);
+#   • вручну (workflow_dispatch) — гілки за шаблоном `pattern` (за замовчуванням after-lab*);
+#                                  pattern `-` — лише та гілка, з якої запущено (--ref).
+# main у список не потрапляє ніколи: знімків на ньому немає, і «core/ порожній» там — норма.
 name: verify snapshots
 
 on:
   push:
     branches: ['after-lab**']
   workflow_dispatch:
+    inputs:
+      pattern:
+        description: 'Які гілки перевірити (glob для git ls-remote). «-» — лише поточна (--ref).'
+        required: false
+        default: 'after-lab*'
   schedule:
     # щотижня: знімок може зламатися не через нас, а через оновлення базового образу
     - cron: '0 6 * * 1'
 
 jobs:
-  verify:
+  branches:
+    name: які гілки перевіряємо
     runs-on: ubuntu-latest
+    outputs:
+      list: ${{ steps.list.outputs.list }}
+    steps:
+      - id: list
+        env:
+          EVENT: ${{ github.event_name }}
+          PATTERN: ${{ github.event.inputs.pattern }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          case "$EVENT" in
+            push) pattern="-" ;;
+            schedule) pattern="after-lab*" ;;
+            *) pattern="$PATTERN" ;;
+          esac
+          if [ "$pattern" = "-" ] || [ -z "$pattern" ]; then
+            names="$GITHUB_REF_NAME"
+          else
+            names="$(git ls-remote --heads "$REPO_URL" "refs/heads/$pattern" | sed 's#.*refs/heads/##' | sort)"
+          fi
+          list="$(printf '%s\n' "$names" | grep -v '^$' | jq -R . | jq -sc .)"
+          echo "list=$list" >> "$GITHUB_OUTPUT"
+          echo "гілки: $list"
+          {
+            echo "### Знімки до перевірки"
+            echo ""
+            if [ "$list" = "[]" ]; then
+              echo "Гілок за шаблоном \`$pattern\` немає — перевіряти нічого."
+            else
+              printf '%s\n' "$names" | sed 's/^/- `/; s/$/`/'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  verify:
+    needs: branches
+    if: needs.branches.outputs.list != '[]'
+    name: ${{ matrix.branch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        branch: ${{ fromJSON(needs.branches.outputs.list) }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.branch }}
 
       - name: Що саме перевіряємо
         id: detect
         run: |
-          echo "branch=${GITHUB_REF#refs/heads/}" >> "$GITHUB_OUTPUT"
           test -f core/sidkit/Cargo.toml && echo "rust=yes" >> "$GITHUB_OUTPUT" || echo "rust=no" >> "$GITHUB_OUTPUT"
           test -f core/capsule/Dockerfile && echo "docker=yes" >> "$GITHUB_OUTPUT" || echo "docker=no" >> "$GITHUB_OUTPUT"
           ls core/wasm/*.wat >/dev/null 2>&1 && echo "wat=yes" >> "$GITHUB_OUTPUT" || echo "wat=no" >> "$GITHUB_OUTPUT"
 
-      - name: Знімок не містить коду рівнів 2-3
+      - name: Знімок щось несе
         run: |
-          # Правило 1: знімок — робочий стан, а не розв'язок.
-          # Порожній знімок теж помилка: гілка after-labNN мусить щось нести.
+          # Порожній знімок — помилка: гілка after-labNN мусить щось нести.
           if [ -z "$(ls -A core 2>/dev/null)" ]; then
             echo "::error::core/ порожній — знімок нічого не несе"; exit 1
           fi
           echo "core/ не порожній — гаразд"
+
+      - name: deploy.sh — синтаксис
+        if: hashFiles('core/capsule/deploy.sh') != ''
+        run: bash -n core/capsule/deploy.sh
 
       - uses: dtolnay/rust-toolchain@stable
         if: steps.detect.outputs.rust == 'yes'
@@ -46,7 +105,9 @@ jobs:
 
       - name: docker build капсули
         if: steps.detect.outputs.docker == 'yes'
-        run: docker build -f core/capsule/Dockerfile -t snapshot-capsule core/capsule
+        # Контекст — core/, а не core/capsule/: капсула пакує код із core/sid/ (ЛР2,
+        # «той самий проєкт лягає в core/sid/, а Dockerfile — у core/capsule/»).
+        run: docker build -f core/capsule/Dockerfile -t snapshot-capsule core
 
       - name: wat2wasm
         if: steps.detect.outputs.wat == 'yes'
@@ -59,10 +120,10 @@ jobs:
 
       - name: Підсумок
         run: |
-          echo "### Знімок \`${{ steps.detect.outputs.branch }}\` збирається" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Знімок \`${{ matrix.branch }}\` збирається" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| що | перевірено |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
           echo "| Rust (\`core/sidkit\`) | ${{ steps.detect.outputs.rust }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Docker (\`core/capsule\`) | ${{ steps.detect.outputs.docker }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Docker (\`core/capsule\`, контекст \`core/\`) | ${{ steps.detect.outputs.docker }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| WAT (\`core/wasm\`) | ${{ steps.detect.outputs.wat }} |" >> "$GITHUB_STEP_SUMMARY"
